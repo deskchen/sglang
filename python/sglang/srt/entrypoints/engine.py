@@ -47,6 +47,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.srt import phantora_time
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -685,6 +686,11 @@ class Engine(EngineScoreMixin, EngineBase):
                 for info in infos:
                     if SCHEDULER_PIDS_ARG in info:
                         all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
+            # Phantora: engine ready — reset the open-loop arrival-schedule
+            # origin so real startup time is counted as work, not as an
+            # arrival gap (see phantora_time.rearm_idle; no-op unless a
+            # client armed open-loop / outside the simulator).
+            phantora_time.rearm_idle()
 
         def wait_for_completion():
             for proc in scheduler_procs:
@@ -1387,6 +1393,14 @@ def _wait_for_scheduler_ready(
                     raise RuntimeError(
                         "Initialization failed. Please see the error messages above."
                     )
+                # Phantora: align the frontend's virtual clock to this
+                # scheduler's post-model-load simulated time (a forward-only
+                # max across all ranks), so request timing starts from the
+                # engine-ready point instead of behind the schedulers'
+                # startup work. This handshake is a multiprocessing.Pipe, not
+                # zmq, so the io_struct.py stamp frame does not cover it.
+                # No-op outside the simulator (stamp absent or 0.0).
+                phantora_time.adopt(data.get("phantora_sim_time", 0.0))
                 scheduler_infos.append(data)
                 break
 

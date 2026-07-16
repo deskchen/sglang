@@ -2152,6 +2152,44 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+# Phantora cross-process simulated-time propagation (see srt/phantora_time.py):
+# broadcast_pyobj / point_to_point_pyobj are the CPU-side (gloo) object
+# transfers that carry scheduling work between the per-rank scheduler
+# processes (TP attn rank 0 re-broadcasts received requests; PP stages hand
+# work downstream). They bypass both the zmq choke point
+# (managers/io_struct.py) and the simulator's faked NCCL collectives, so the
+# sender's virtual clock rides inside the pickled payload here: the src wraps
+# (_PHANTORA_STAMP_TAG, stamp, data) and the receiver adopts the stamp
+# (forward-only max) before unwrapping. All ranks share one environment, so
+# the wrap/unwrap gate (phantora_time.enabled()) always agrees across ranks;
+# outside the simulator the wire format is byte-identical to upstream. The
+# empty fast path (size 0) stays unstamped: no work crosses, and rank clocks
+# still synchronize through the simulated forward-pass collectives.
+_PHANTORA_STAMP_TAG = "__phantora_stamp__"
+
+
+def _phantora_wrap_pyobj(data):
+    from sglang.srt import phantora_time
+
+    if phantora_time.enabled():
+        return (_PHANTORA_STAMP_TAG, phantora_time.stamp(), data)
+    return data
+
+
+def _phantora_unwrap_pyobj(data):
+    from sglang.srt import phantora_time
+
+    if (
+        phantora_time.enabled()
+        and isinstance(data, tuple)
+        and len(data) == 3
+        and data[0] == _PHANTORA_STAMP_TAG
+    ):
+        phantora_time.adopt(data[1])
+        return data[2]
+    return data
+
+
 def broadcast_pyobj(
     data: List[Any],
     rank: int,
@@ -2174,7 +2212,7 @@ def broadcast_pyobj(
             tensor_size = torch.tensor([0], dtype=torch.long, device=device)
             dist.broadcast(tensor_size, src=src, group=dist_group)
         else:
-            serialized_data = pickle.dumps(data)
+            serialized_data = pickle.dumps(_phantora_wrap_pyobj(data))
             size = len(serialized_data)
 
             tensor_data = torch.ByteTensor(
@@ -2197,7 +2235,7 @@ def broadcast_pyobj(
         dist.broadcast(tensor_data, src=src, group=dist_group)
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = _phantora_unwrap_pyobj(pickle.loads(serialized_data))
         return data
 
 
@@ -2227,7 +2265,7 @@ def point_to_point_pyobj(
             if async_send:
                 p2p_works.append(P2PWork(work, tensor_size))
         else:
-            serialized_data = pickle.dumps(data)
+            serialized_data = pickle.dumps(_phantora_wrap_pyobj(data))
             size = len(serialized_data)
             tensor_data = torch.ByteTensor(
                 np.frombuffer(serialized_data, dtype=np.uint8)
@@ -2262,7 +2300,7 @@ def point_to_point_pyobj(
         work.wait()
 
         serialized_data = bytes(tensor_data.cpu().numpy())
-        data = pickle.loads(serialized_data)
+        data = _phantora_unwrap_pyobj(pickle.loads(serialized_data))
         return data
 
     # Other ranks in pp_group do nothing

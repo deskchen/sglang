@@ -637,11 +637,21 @@ class Scheduler(
             logger.warning("load snapshot writer init failed: %s", e)
 
     def init_idle_sleeper(self) -> None:
+        from sglang.srt import phantora_time
+
+        # Phantora: force sleep-on-idle under the simulator. The event loop
+        # otherwise busy-spins through recv_requests()/on_idle() whenever there
+        # is no batch, and under a frozen virtual clock an idle spin never
+        # ends on its own — it livelocks the process and storms the GIL (the
+        # same failure class as vLLM's shm busy-poll). IdleSleeper blocks in
+        # zmq.Poller.poll with a real 1s cap, so a lost wake-up self-heals.
+        # Non-rank-0 replicas need nothing: they block in the gloo
+        # broadcast_pyobj inside recv_requests.
         if (
             self.ps.pp_rank == 0
             and self.ps.attn_tp_rank == 0
             and self.ps.attn_cp_rank == 0
-            and self.server_args.sleep_on_idle
+            and (self.server_args.sleep_on_idle or phantora_time.enabled())
         ):
             self.idle_sleeper = IdleSleeper(
                 sockets=[
@@ -1447,10 +1457,18 @@ class Scheduler(
         This method provides the initialization info needed by the tokenizer manager
         and other components to verify the scheduler is ready.
         """
+        from sglang.srt import phantora_time
+
         result_dict = {
             "status": "ready",
             "max_total_num_tokens": self.max_total_num_tokens,
             "max_req_input_len": self.max_req_input_len,
+            # Phantora: this scheduler's post-model-load simulated time, so the
+            # frontend aligns its virtual clock here before any request is
+            # timed (see engine.py _wait_for_scheduler_ready). This handshake
+            # rides a multiprocessing.Pipe, not zmq, so the io_struct.py stamp
+            # frame does not cover it. 0.0 => not under the simulator.
+            "phantora_sim_time": phantora_time.stamp(),
         }
 
         return result_dict

@@ -2250,7 +2250,53 @@ def msgpack_decode(data: bytes) -> Any:
     return _maybe_unwrap_pickle(_msgpack_decoder.decode(data))
 
 
+# ---------------------------------------------------------------------------
+# Phantora cross-process simulated-time propagation (see srt/phantora_time.py).
+#
+# Every SGLang inter-process zmq hop (tokenizer->scheduler,
+# scheduler->detokenizer->tokenizer, scheduler->tokenizer direct, RPC) funnels
+# through the four helpers below, so this is the single choke point where the
+# sender's virtual clock is stamped onto the wire and the receiver adopts it
+# (forward-only max). The stamp travels as a SECOND zmq frame appended to the
+# payload: multipart messages are atomic in zmq, so the pair cannot tear, a
+# NOBLOCK recv sees both frames or raises before either, and the wire format
+# of the payload frame itself is untouched (msgpack and pickle modes both
+# work). Everything is a no-op outside the Phantora simulator — no extra
+# frame is sent, none is expected.
+
+import struct as _struct
+
+from sglang.srt import phantora_time as _phantora_time
+
+_PHANTORA_STAMP_FMT = "<d"
+_PHANTORA_STAMP_LEN = 8
+
+
+def _phantora_send_stamp(socket, flags: int) -> None:
+    """Append the sender's simulated-time frame (caller passed SNDMORE on the
+    payload frame)."""
+    socket.send(
+        _struct.pack(_PHANTORA_STAMP_FMT, _phantora_time.stamp()), flags=flags
+    )
+
+
+def _phantora_adopt_stamp_frame(frame: bytes) -> None:
+    if len(frame) == _PHANTORA_STAMP_LEN:
+        _phantora_time.adopt(_struct.unpack(_PHANTORA_STAMP_FMT, frame)[0])
+
+
 def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
+    if _phantora_time.enabled():
+        # Phantora: payload frame + simulated-time stamp frame (atomic pair).
+        if _USE_PICKLE_IPC:
+            socket.send_pyobj(
+                obj, flags=flags | zmq.SNDMORE, protocol=pickle.HIGHEST_PROTOCOL
+            )
+        else:
+            socket.send(msgpack_encode(obj), flags=flags | zmq.SNDMORE)
+        _phantora_send_stamp(socket, flags)
+        return
+
     if _USE_PICKLE_IPC:
         socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
         return
@@ -2260,13 +2306,31 @@ def sock_send(socket: zmq.Socket, obj: Any, flags: int = 0) -> None:
 
 def sock_recv(socket: zmq.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
-        return socket.recv_pyobj(flags=flags)
-
-    data = socket.recv(flags=flags)
-    return msgpack_decode(data)
+        obj = socket.recv_pyobj(flags=flags)
+    else:
+        obj = msgpack_decode(socket.recv(flags=flags))
+    # Phantora: adopt the sender's simulated time. The stamp frame is part of
+    # the same multipart message, so this recv never blocks (no NOBLOCK
+    # needed) and RCVMORE is False for unstamped senders.
+    if _phantora_time.enabled() and socket.getsockopt(zmq.RCVMORE):
+        _phantora_adopt_stamp_frame(socket.recv())
+    return obj
 
 
 async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) -> None:
+    if _phantora_time.enabled():
+        # Phantora: payload frame + simulated-time stamp frame (atomic pair).
+        if _USE_PICKLE_IPC:
+            await socket.send_pyobj(
+                obj, flags=flags | zmq.SNDMORE, protocol=pickle.HIGHEST_PROTOCOL
+            )
+        else:
+            await socket.send(msgpack_encode(obj), flags=flags | zmq.SNDMORE)
+        await socket.send(
+            _struct.pack(_PHANTORA_STAMP_FMT, _phantora_time.stamp()), flags=flags
+        )
+        return
+
     if _USE_PICKLE_IPC:
         await socket.send_pyobj(obj, flags=flags, protocol=pickle.HIGHEST_PROTOCOL)
         return
@@ -2276,7 +2340,10 @@ async def async_sock_send(socket: zmq.asyncio.Socket, obj: Any, flags: int = 0) 
 
 async def async_sock_recv(socket: zmq.asyncio.Socket, flags: int = 0) -> Any:
     if _USE_PICKLE_IPC:
-        return await socket.recv_pyobj(flags=flags)
-
-    data = await socket.recv(flags=flags)
-    return msgpack_decode(data)
+        obj = await socket.recv_pyobj(flags=flags)
+    else:
+        obj = msgpack_decode(await socket.recv(flags=flags))
+    # Phantora: adopt the sender's simulated time (see sock_recv).
+    if _phantora_time.enabled() and socket.getsockopt(zmq.RCVMORE):
+        _phantora_adopt_stamp_frame(await socket.recv())
+    return obj
