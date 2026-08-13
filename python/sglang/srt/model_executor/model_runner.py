@@ -25,6 +25,7 @@ from typing import Optional, Union
 import torch
 import torch.distributed as dist
 
+from sglang.srt import phantora_time
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import (
     AttentionArch,
@@ -1518,6 +1519,11 @@ class ModelRunner:
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
+        )
+        next_token_ids = phantora_time.replace_sampled_token_ids(
+            next_token_ids,
+            forward_batch,
+            overlap_enabled=not self.server_args.disable_overlap_schedule,
         )
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,

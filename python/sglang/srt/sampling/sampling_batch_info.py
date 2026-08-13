@@ -169,9 +169,11 @@ class SamplingBatchInfo:
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = None
+
+        custom_params = [r.sampling_params.custom_params for r in reqs]
+        if not any(param is not None for param in custom_params):
             custom_params = None
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
@@ -299,8 +301,10 @@ class SamplingBatchInfo:
     def filter_batch(self, keep_indices: List[int], keep_indices_device: torch.Tensor):
         self.penalizer_orchestrator.filter(keep_indices_device)
 
+        if self.custom_params is not None:
+            self.custom_params = [self.custom_params[i] for i in keep_indices]
         if self.has_custom_logit_processor:
-            self._filter_batch_custom_logit_processor(keep_indices, keep_indices_device)
+            self._filter_batch_custom_logit_processor(keep_indices_device)
 
         for item in [
             "temperatures",
@@ -322,10 +326,8 @@ class SamplingBatchInfo:
 
         self.adjusted_filter_batch(keep_indices, keep_indices_device)
 
-    def _filter_batch_custom_logit_processor(
-        self, keep_indices: List[int], keep_indices_device: torch.Tensor
-    ):
-        """Filter the custom logit processor and custom params"""
+    def _filter_batch_custom_logit_processor(self, keep_indices_device: torch.Tensor):
+        """Filter custom logit processors; custom params are independent."""
         self.custom_logit_processor = {
             k: (p, mask[keep_indices_device])
             for k, (p, mask) in self.custom_logit_processor.items()
@@ -333,13 +335,8 @@ class SamplingBatchInfo:
                 mask[keep_indices_device]
             )  # ignore the custom logit processor whose mask is all False
         }
-        self.custom_params = [self.custom_params[i] for i in keep_indices]
-
-        # If the custom logit processor is an empty dict, set the flag to False,
-        # and set the custom logit processor and custom params to None.
         if len(self.custom_logit_processor) == 0:
             self.custom_logit_processor = None
-            self.custom_params = None
             self.has_custom_logit_processor = False
 
     @staticmethod
@@ -385,28 +382,26 @@ class SamplingBatchInfo:
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
 
-        # Merge the custom logit processors and custom params lists
+        self_len = len(self)
+        other_len = len(other)
+
+        # Merge custom params independently: Phantora's explicit token trace
+        # uses the existing request metadata carrier without a logit processor.
+        if self.custom_params is not None or other.custom_params is not None:
+            self.custom_params = self.custom_params or [None] * self_len
+            self.custom_params.extend(other.custom_params or [None] * other_len)
+
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
-            # Merge the custom logit processors
             self.custom_logit_processor = (
                 SamplingBatchInfo.merge_custom_logit_processor(
                     self.custom_logit_processor,
                     other.custom_logit_processor,
-                    len(self),
-                    len(other),
+                    self_len,
+                    other_len,
                     self.device,
                 )
             )
-            # Merge the custom params lists
-            self.custom_params = self.custom_params or [None] * len(self)
-            other.custom_params = other.custom_params or [None] * len(other)
-            self.custom_params.extend(other.custom_params)
-
-            # Set the flag to True if any of the two has custom logit processor
             self.has_custom_logit_processor = True
-
-        self_len = len(self)
-        other_len = len(other)
 
         # Merge logit bias - note this has to come before the temperatures tensor update! Otherwise will cause crashes.
         # See note below on len(self) and len(other).

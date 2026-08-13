@@ -155,6 +155,90 @@ def adopt_idle_gap(arrival_real: float | None = None) -> None:
     cur = _stamp()
     if slot > cur:
         if os.environ.get("PHANTORA_IDLE_TRACE") == "1":
-            print(f"[idle-gap] slot={slot:.3f} cur={cur:.3f} "
-                  f"adv={slot - cur:.3f}s", flush=True)
+            print(
+                f"[idle-gap] slot={slot:.3f} cur={cur:.3f} " f"adv={slot - cur:.3f}s",
+                flush=True,
+            )
         _adopt(slot)
+
+
+def replace_sampled_token_ids(next_token_ids, forward_batch, *, overlap_enabled):
+    """Use an explicit workload token trace only under Phantora simulation."""
+    if not _enabled:
+        return next_token_ids
+
+    info = forward_batch.sampling_info
+    params = info.custom_params
+    traced = [
+        isinstance(param, dict) and "phantora_token_trace" in param
+        for param in (params or [])
+    ]
+    if not any(traced):
+        return next_token_ids
+    if (
+        len(traced) != next_token_ids.numel()
+        or not all(traced)
+        or not forward_batch.spec_algorithm.is_none()
+        or forward_batch.return_logprob
+        or any(info.return_sampling_masks or [])
+        or info.has_custom_logit_processor
+    ):
+        raise RuntimeError("invalid Phantora token-trace batch")
+
+    resolved = []
+    for param in params:
+        req = param.get("__req__")
+        trace = param["phantora_token_trace"]
+        sampling = getattr(req, "sampling_params", None)
+        position = getattr(req, "_phantora_token_trace_position", 0)
+        if (
+            req is None
+            or sampling is None
+            or not isinstance(trace, list)
+            or not trace
+            or not all(type(token_id) is int for token_id in trace)
+            or type(req.vocab_size) is not int
+            or req.vocab_size <= 0
+            or any(token_id < 0 or token_id >= req.vocab_size for token_id in trace)
+            or type(position) is not int
+            or position < 0
+            or position > len(trace)
+            or sampling.max_new_tokens != len(trace)
+            or not sampling.ignore_eos
+            or sampling.stop_token_ids
+            or sampling.stop_strs
+            or sampling.stop_regex_strs
+            or req.grammar is not None
+            or req.inflight_middle_chunks > 0
+        ):
+            raise RuntimeError("invalid or exhausted Phantora token trace")
+        terminal_drain = position == len(trace)
+        if terminal_drain and (
+            not overlap_enabled
+            or not forward_batch.forward_mode.is_decode()
+            or req.finished()
+            or req.is_retracted
+            or req.to_finish is not None
+            or len(req.output_ids) != len(trace) - 1
+            or param.get("__phantora_token_trace_terminal_drain", False)
+        ):
+            raise RuntimeError("invalid or exhausted Phantora token trace")
+        resolved.append(
+            (
+                param,
+                req,
+                position,
+                trace[-1] if terminal_drain else trace[position],
+                terminal_drain,
+            )
+        )
+
+    for param, req, position, _, terminal_drain in resolved:
+        if terminal_drain:
+            # Request-local custom params own this flag, so a recycled request-pool
+            # slot cannot inherit terminal-drain state from its previous request.
+            param["__phantora_token_trace_terminal_drain"] = True
+        else:
+            req._phantora_token_trace_position = position + 1
+        req.skip_radix_cache_insert = True
+    return next_token_ids.new_tensor([token_id for _, _, _, token_id, _ in resolved])
